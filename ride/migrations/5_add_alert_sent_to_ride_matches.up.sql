@@ -1,0 +1,2 @@
+ALTER TABLE ride_matches 
+ADD COLUMN start_reminder_sent BOOLEAN NOT NULL DEFAULT FALSE;
