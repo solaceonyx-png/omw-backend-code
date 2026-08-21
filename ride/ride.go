@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	myauth "encore.app/auth"
+	"encore.dev/beta/auth"
 	"encore.dev/beta/errs"
 	"encore.dev/cron"
 	"encore.dev/storage/sqldb"
@@ -19,6 +22,170 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+type User struct {
+	ID        int64      `gorm:"primaryKey;autoIncrement" json:"id"`
+	Auth0ID   string     `gorm:"column:auth0_id;type:varchar(255);uniqueIndex;not null" json:"auth0Id"`
+	Email     string     `gorm:"column:email;type:varchar(255)" json:"email"`
+	FirstName string     `gorm:"column:first_name;type:varchar(100)" json:"firstName"`
+	LastName  string     `gorm:"column:last_name;type:varchar(100)" json:"lastName"`
+	BirthDate *time.Time `gorm:"column:birth_date;type:date" json:"birthDate"` // 👈 Added
+	// PhoneNumber string     `gorm:"column:phone_number;type:varchar(50)" json:"phoneNumber"`
+	AvatarURL string    `gorm:"column:avatar_url;type:text" json:"avatarUrl"`
+	IsDriver  bool      `gorm:"column:is_driver;default:false;not null" json:"isDriver"`
+	CreatedAt time.Time `gorm:"column:created_at;autoCreateTime" json:"createdAt"`
+	UpdatedAt time.Time `gorm:"column:updated_at;autoUpdateTime" json:"updatedAt"`
+}
+
+func (User) TableName() string {
+	return "users"
+}
+
+//encore:api auth path=/users/me method=GET
+func (s *Service) GetMyProfile(ctx context.Context) (*User, error) {
+	return s.GetOrCreateUser(ctx)
+}
+
+// GetOrCreateUser resolves an internal user record from an Auth0 UID.
+// Optionally updates email or name if provided by the auth payload.
+// GetOrCreateUser pulls authenticated data directly from context and syncs the DB
+func (s *Service) GetOrCreateUser(ctx context.Context) (*User, error) {
+	fmt.Println("GetOrCreateUser called")
+	// 1. Pull verified auth payload
+	userData, ok := auth.Data().(*myauth.UserData)
+	if !ok || userData == nil {
+		return nil, &errs.Error{
+			Code:    errs.Unauthenticated,
+			Message: "missing or invalid user auth data",
+		}
+	}
+	fmt.Println(userData)
+	var user User
+
+	// 2. Lookup existing user
+	err := s.db.WithContext(ctx).
+		Where("auth0_id = ?", userData.Auth0ID).
+		First(&user).Error
+
+	fmt.Println(user)
+	if err == nil {
+		// Optional: Keep is_driver or email up-to-date if changed in Auth0
+		if user.IsDriver != userData.IsDriver {
+			s.db.WithContext(ctx).Model(&user).Update("is_driver", userData.IsDriver)
+			user.IsDriver = userData.IsDriver
+		}
+		return &user, nil
+	}
+
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, fmt.Errorf("database lookup error: %w", err)
+	}
+
+	// 3. Auto-provision new user with role from Auth0
+	newUser := User{
+		Auth0ID:   userData.Auth0ID,
+		Email:     userData.Email,
+		IsDriver:  userData.IsDriver,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+
+	if err := s.db.WithContext(ctx).Create(&newUser).Error; err != nil {
+		return nil, fmt.Errorf("failed to auto-provision user: %w", err)
+	}
+
+	return &newUser, nil
+}
+
+type UpdateProfileResponse struct {
+	User *User `json:"user"`
+}
+type UpdateProfileParams struct {
+	FirstName string `json:"firstName"`
+	LastName  string `json:"lastName"`
+	BirthDate string `json:"birthDate"` // Expects "YYYY-MM-DD"
+}
+
+// Helper to calculate exact age in years
+func calculateAge(birthDate time.Time) int {
+	now := time.Now().UTC()
+	years := now.Year() - birthDate.Year()
+
+	// Adjust if the birthday hasn't occurred yet this year
+	if now.YearDay() < birthDate.YearDay() {
+		years--
+	}
+	return years
+}
+
+//encore:api auth path=/users/profile method=PUT
+func (s *Service) UpdateProfile(ctx context.Context, params *UpdateProfileParams) (*UpdateProfileResponse, error) {
+	user, err := s.GetOrCreateUser(ctx)
+	if err != nil {
+		return nil, &errs.Error{
+			Code:    errs.Internal,
+			Message: "Failed to resolve authenticated user",
+		}
+	}
+
+	firstName := strings.TrimSpace(params.FirstName)
+	lastName := strings.TrimSpace(params.LastName)
+	birthDateStr := strings.TrimSpace(params.BirthDate)
+
+	if firstName == "" || lastName == "" {
+		return nil, &errs.Error{
+			Code:    errs.InvalidArgument,
+			Message: "First name and last name are required.",
+		}
+	}
+
+	if birthDateStr == "" {
+		return nil, &errs.Error{
+			Code:    errs.InvalidArgument,
+			Message: "Birth date is required.",
+		}
+	}
+
+	parsedDate, err := time.Parse("2006-01-02", birthDateStr)
+	if err != nil {
+		return nil, &errs.Error{
+			Code:    errs.InvalidArgument,
+			Message: "Invalid birth date format. Use YYYY-MM-DD.",
+		}
+	}
+
+	// 🚫 Age validation: User must be at least 18
+	age := calculateAge(parsedDate)
+	if age < 18 {
+		return nil, &errs.Error{
+			Code:    errs.InvalidArgument,
+			Message: "You must be at least 18 years old to use this platform.",
+		}
+	}
+
+	updates := map[string]interface{}{
+		"first_name": firstName,
+		"last_name":  lastName,
+		"birth_date": parsedDate,
+		"updated_at": time.Now().UTC(),
+	}
+
+	err = s.db.WithContext(ctx).
+		Model(&User{}).
+		Where("id = ?", user.ID).
+		Updates(updates).Error
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to update user profile: %w", err)
+	}
+
+	user.FirstName = firstName
+	user.LastName = lastName
+	user.BirthDate = &parsedDate
+	user.UpdatedAt = updates["updated_at"].(time.Time)
+
+	return &UpdateProfileResponse{User: user}, nil
+}
 
 // CreateRideParams matches the frontend JSON payload
 type CreateRideParams struct {
@@ -41,15 +208,33 @@ type CreateRideResponse struct {
 	CreatedAt     time.Time `json:"created_at"`
 }
 
-//encore:api public path=/rides/create method=POST
+//encore:api auth path=/rides/create method=POST
 func (s *Service) CreateRideRequest(ctx context.Context, params *CreateRideParams) (*CreateRideResponse, error) {
-	fmt.Println("reached here")
 
+	// Resolve internal user directly from context
+	user, err := s.GetOrCreateUser(ctx)
+	if err != nil {
+		return nil, &errs.Error{
+			Code:    errs.Internal,
+			Message: "Failed to resolve user account",
+		}
+	}
+
+	// Check role authorization
+	if user.IsDriver {
+		return nil, &errs.Error{
+			Code:    errs.PermissionDenied,
+			Message: "Drivers are not permitted to create passenger ride requests.",
+		}
+	}
+
+	fmt.Print(user.ID)
+	fmt.Println(user)
 	// 1. Check existing ride request count for this passenger
 	var activeCount int64
-	err := s.db.WithContext(ctx).
+	err = s.db.WithContext(ctx).
 		Table("ride_requests").
-		Where("passenger_id = ?", params.PassengerID).
+		Where("passenger_id = ?", user.ID).
 		Count(&activeCount).Error
 
 	if err != nil {
@@ -66,7 +251,7 @@ func (s *Service) CreateRideRequest(ctx context.Context, params *CreateRideParam
 
 	// 2. Build a raw data map to completely bypass GORM type-reflection errors
 	rideData := map[string]interface{}{
-		"passenger_id":      params.PassengerID,
+		"passenger_id":      user.ID,
 		"ride_date":         params.RideDate,
 		"ride_time":         params.RideTime,
 		"repeat_days":       pq.StringArray(params.RepeatDays),
@@ -157,13 +342,22 @@ type DeleteRideResponse struct {
 	Success bool `json:"success"`
 }
 
-//encore:api public path=/rides/:rideID/user/:passengerID method=DELETE
-func (s *Service) DeleteRideRequest(ctx context.Context, rideID int64, passengerID int64) (*DeleteRideResponse, error) {
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+//encore:api public path=/rides/:rideID/user method=DELETE
+func (s *Service) DeleteRideRequest(ctx context.Context, rideID int64) (*DeleteRideResponse, error) {
+	// 1. Resolve internal user record from authenticated context
+	user, err := s.GetOrCreateUser(ctx)
+	if err != nil {
+		return nil, &errs.Error{
+			Code:    errs.Internal,
+			Message: "Failed to resolve user account",
+		}
+	}
+
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// 1. Verify ownership and check if the ride request exists
 		var count int64
 		if err := tx.Table("ride_requests").
-			Where("id = ? AND passenger_id = ?", rideID, passengerID).
+			Where("id = ? AND passenger_id = ?", rideID, user.ID).
 			Count(&count).Error; err != nil {
 			return fmt.Errorf("failed to verify ride request ownership: %w", err)
 		}
@@ -184,7 +378,7 @@ func (s *Service) DeleteRideRequest(ctx context.Context, rideID int64, passenger
 
 		// 3. Delete the ride request itself
 		result := tx.Table("ride_requests").
-			Where("id = ? AND passenger_id = ?", rideID, passengerID).
+			Where("id = ? AND passenger_id = ?", rideID, user.ID).
 			Delete(nil)
 
 		if result.Error != nil {
@@ -201,12 +395,20 @@ func (s *Service) DeleteRideRequest(ctx context.Context, rideID int64, passenger
 	return &DeleteRideResponse{Success: true}, nil
 }
 
-//encore:api public path=/rides/user/:passengerID method=GET
-func (s *Service) GetUserRides(ctx context.Context, passengerID int64) (*GetUserRidesResponse, error) {
-	var rides []RideRequest
+//encore:api public path=/rides/user method=GET
+func (s *Service) GetUserRides(ctx context.Context) (*GetUserRidesResponse, error) {
+	// 1. Resolve internal user record from authenticated context
+	user, err := s.GetOrCreateUser(ctx)
+	if err != nil {
+		return nil, &errs.Error{
+			Code:    errs.Internal,
+			Message: "Failed to resolve user account",
+		}
+	}
 
+	var rides []RideRequest
 	// Uses COALESCE to set status to 'Matched' if a match record exists, otherwise 'Scheduled'
-	err := s.db.WithContext(ctx).
+	err = s.db.WithContext(ctx).
 		Table("ride_requests rr").
 		Select(`
 			rr.id,
@@ -224,7 +426,7 @@ func (s *Service) GetUserRides(ctx context.Context, passengerID int64) (*GetUser
 			rr.created_at
 		`).
 		Joins("LEFT JOIN ride_matches rm ON rm.ride_request_id = rr.id").
-		Where("rr.passenger_id = ?", passengerID).
+		Where("rr.passenger_id = ?", user.ID).
 		Order("rr.created_at DESC").
 		Find(&rides).Error
 
@@ -253,8 +455,26 @@ type CreateCommuteResponse struct {
 	CreatedAt time.Time `json:"createdAt"`
 }
 
-//encore:api public path=/commutes/create method=POST
+//encore:api auth path=/commutes/create method=POST
 func (s *Service) CreateCommute(ctx context.Context, params *CreateCommuteParams) (*CreateCommuteResponse, error) {
+	fmt.Println("reached here")
+	// Resolve internal user directly from context
+	user, err := s.GetOrCreateUser(ctx)
+	if err != nil {
+		return nil, &errs.Error{
+			Code:    errs.Internal,
+			Message: "Failed to resolve user account",
+		}
+	}
+
+	// Check role authorization
+	if !user.IsDriver {
+		return nil, &errs.Error{
+			Code:    errs.PermissionDenied,
+			Message: "Only drivers are permitted to create commutes.",
+		}
+	}
+
 	if params.StartLocation == "" || params.EndLocation == "" || params.StartTime == "" {
 		return nil, &errs.Error{
 			Code:    errs.InvalidArgument,
@@ -264,7 +484,7 @@ func (s *Service) CreateCommute(ctx context.Context, params *CreateCommuteParams
 
 	// 1. Check existing commute count for this driver
 	var existingCount int64
-	err := s.db.WithContext(ctx).
+	err = s.db.WithContext(ctx).
 		Table("commutes").
 		Where("driver_id = ?", params.DriverID).
 		Count(&existingCount).Error
