@@ -1,6 +1,6 @@
 {
   "id": "omw-backend-code-dwpi",
-  "cors": {
+  "global_cors": {
     "allow_origins_with_credentials": [
       "http://localhost:4200",
       "https://d3ky60yagjwjd2.cloudfront.net"
