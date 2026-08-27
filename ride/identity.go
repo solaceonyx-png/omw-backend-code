@@ -264,8 +264,8 @@ func (s *Service) applyVerificationSessionUpdate(ctx context.Context, session *s
 	if result.RowsAffected == 0 {
 		// The session wasn't created through CreateVerificationSession (e.g.
 		// started directly from the Stripe dashboard) — record it now.
-		var userID int64
-		if _, err := fmt.Sscanf(session.Metadata["user_id"], "%d", &userID); err != nil || userID == 0 {
+		userID, ok := verificationSessionUserID(session)
+		if !ok {
 			return fmt.Errorf("verification session %s has no known user_id, cannot record", session.ID)
 		}
 
@@ -284,5 +284,29 @@ func (s *Service) applyVerificationSessionUpdate(ctx context.Context, session *s
 		}
 	}
 
+	if session.Status == stripe.IdentityVerificationSessionStatusVerified {
+		if userID, ok := verificationSessionUserID(session); ok {
+			err := s.db.WithContext(ctx).Model(&User{}).
+				Where("id = ?", userID).
+				Updates(map[string]interface{}{
+					"is_identity_verified": true,
+					"identity_verified_at": time.Now().UTC(),
+				}).Error
+			if err != nil {
+				return fmt.Errorf("failed to mark user %d identity-verified: %w", userID, err)
+			}
+		}
+	}
+
 	return nil
+}
+
+// verificationSessionUserID extracts the user_id we attach as metadata when
+// creating a verification session.
+func verificationSessionUserID(session *stripe.IdentityVerificationSession) (int64, bool) {
+	var userID int64
+	if _, err := fmt.Sscanf(session.Metadata["user_id"], "%d", &userID); err != nil || userID == 0 {
+		return 0, false
+	}
+	return userID, true
 }
