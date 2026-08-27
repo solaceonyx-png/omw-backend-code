@@ -18,6 +18,7 @@ import (
 	"encore.dev/cron"
 	"encore.dev/storage/sqldb"
 	"github.com/lib/pq"
+	stripe "github.com/stripe/stripe-go/v78"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -69,10 +70,18 @@ func (s *Service) GetOrCreateUser(ctx context.Context) (*User, error) {
 
 	fmt.Println(user)
 	if err == nil {
-		// Optional: Keep is_driver or email up-to-date if changed in Auth0
+		// Keep is_driver and email up-to-date if changed in Auth0.
+		updates := map[string]interface{}{}
 		if user.IsDriver != userData.IsDriver {
-			s.db.WithContext(ctx).Model(&user).Update("is_driver", userData.IsDriver)
+			updates["is_driver"] = userData.IsDriver
 			user.IsDriver = userData.IsDriver
+		}
+		if userData.Email != "" && user.Email != userData.Email {
+			updates["email"] = userData.Email
+			user.Email = userData.Email
+		}
+		if len(updates) > 0 {
+			s.db.WithContext(ctx).Model(&user).Updates(updates)
 		}
 		return &user, nil
 	}
@@ -1181,6 +1190,10 @@ var rideDB = sqldb.NewDatabase("ride", sqldb.DatabaseConfig{
 // }
 
 func initService() (*Service, error) {
+	// Trim defensively: a stray trailing newline in a pasted/piped secret
+	// value breaks the Authorization header Stripe's client builds from it.
+	stripe.Key = strings.TrimSpace(secrets.StripeSecretKey)
+
 	db, err := gorm.Open(postgres.New(postgres.Config{
 		Conn: rideDB.Stdlib(),
 	}))
