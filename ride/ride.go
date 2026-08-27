@@ -32,10 +32,12 @@ type User struct {
 	LastName  string     `gorm:"column:last_name;type:varchar(100)" json:"lastName"`
 	BirthDate *time.Time `gorm:"column:birth_date;type:date" json:"birthDate"` // 👈 Added
 	// PhoneNumber string     `gorm:"column:phone_number;type:varchar(50)" json:"phoneNumber"`
-	AvatarURL string    `gorm:"column:avatar_url;type:text" json:"avatarUrl"`
-	IsDriver  bool      `gorm:"column:is_driver;default:false;not null" json:"isDriver"`
-	CreatedAt time.Time `gorm:"column:created_at;autoCreateTime" json:"createdAt"`
-	UpdatedAt time.Time `gorm:"column:updated_at;autoUpdateTime" json:"updatedAt"`
+	AvatarURL          string     `gorm:"column:avatar_url;type:text" json:"avatarUrl"`
+	IsDriver           bool       `gorm:"column:is_driver;default:false;not null" json:"isDriver"`
+	IsIdentityVerified bool       `gorm:"column:is_identity_verified;default:false;not null" json:"isIdentityVerified"`
+	IdentityVerifiedAt *time.Time `gorm:"column:identity_verified_at" json:"identityVerifiedAt,omitempty"`
+	CreatedAt          time.Time  `gorm:"column:created_at;autoCreateTime" json:"createdAt"`
+	UpdatedAt          time.Time  `gorm:"column:updated_at;autoUpdateTime" json:"updatedAt"`
 }
 
 func (User) TableName() string {
@@ -234,6 +236,13 @@ func (s *Service) CreateRideRequest(ctx context.Context, params *CreateRideParam
 		return nil, &errs.Error{
 			Code:    errs.PermissionDenied,
 			Message: "Drivers are not permitted to create passenger ride requests.",
+		}
+	}
+
+	if !user.IsIdentityVerified {
+		return nil, &errs.Error{
+			Code:    errs.PermissionDenied,
+			Message: "Identity verification is required before creating a ride request.",
 		}
 	}
 
