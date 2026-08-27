@@ -196,7 +196,13 @@ func (s *Service) HandleStripeWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	event, err := webhook.ConstructEvent(payload, r.Header.Get("Stripe-Signature"), secrets.StripeWebhookSecret)
+	// IgnoreAPIVersionMismatch: stripe-go pins an expected event API version
+	// and refuses otherwise-validly-signed events sent at a newer one. We
+	// only read a handful of long-stable fields below (id, status,
+	// last_error, verification_flow, metadata), so a version drift there is
+	// low-risk. Signature validation still runs and must pass regardless.
+	event, err := webhook.ConstructEventWithOptions(payload, r.Header.Get("Stripe-Signature"), secrets.StripeWebhookSecret,
+		webhook.ConstructEventOptions{IgnoreAPIVersionMismatch: true})
 	if err != nil {
 		fmt.Println("HandleStripeWebhook: signature verification error:", err)
 		http.Error(w, "invalid signature", http.StatusBadRequest)
