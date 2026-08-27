@@ -1,8 +1,12 @@
-// Service identity implements Stripe Identity document verification:
-// creating verification sessions against a dashboard-configured Verification
-// Flow, exposing status to the frontend, and consuming Stripe's webhook to
-// keep that status up to date.
-package identity
+package rideshare
+
+// Stripe Identity document verification: creating verification sessions
+// against a dashboard-configured Verification Flow, exposing status to the
+// frontend, and consuming Stripe's webhook to keep that status up to date.
+//
+// Lives in the ride service (same DB as `users`) rather than as its own
+// service/database — there's no need for that separation yet, and keeping
+// it here lets verification sessions reference users.id directly.
 
 import (
 	"context"
@@ -13,19 +17,15 @@ import (
 	"net/http"
 	"time"
 
-	myauth "encore.app/auth"
-	"encore.dev/beta/auth"
 	"encore.dev/beta/errs"
 	"encore.dev/config"
-	"encore.dev/storage/sqldb"
 	stripe "github.com/stripe/stripe-go/v78"
 	"github.com/stripe/stripe-go/v78/identity/verificationsession"
 	"github.com/stripe/stripe-go/v78/webhook"
-	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
-type IdentityConfig struct {
+type RideConfig struct {
 	// VerificationFlowID is the ID of the Verification Flow created in the
 	// Stripe dashboard (Identity > Verification flows), e.g. "vf_...".
 	VerificationFlowID config.String
@@ -34,7 +34,7 @@ type IdentityConfig struct {
 	ReturnURL config.String
 }
 
-var cfg = config.Load[*IdentityConfig]()
+var cfg = config.Load[*RideConfig]()
 
 var secrets struct {
 	// StripeSecretKey is the Stripe API secret key (sk_test_... / sk_live_...).
@@ -44,32 +44,10 @@ var secrets struct {
 	StripeWebhookSecret string
 }
 
-//encore:service
-type Service struct {
-	db *gorm.DB
-}
-
-var identityDB = sqldb.NewDatabase("identity", sqldb.DatabaseConfig{
-	Migrations: "./migrations",
-})
-
-func initService() (*Service, error) {
-	stripe.Key = secrets.StripeSecretKey
-
-	db, err := gorm.Open(postgres.New(postgres.Config{
-		Conn: identityDB.Stdlib(),
-	}))
-	if err != nil {
-		return nil, err
-	}
-
-	return &Service{db: db}, nil
-}
-
 // VerificationSession tracks a Stripe Identity verification attempt for a user.
 type VerificationSession struct {
 	ID               int64      `gorm:"primaryKey;autoIncrement" json:"id"`
-	Auth0ID          string     `gorm:"column:auth0_id;type:varchar(255);not null;index" json:"auth0Id"`
+	UserID           int64      `gorm:"column:user_id;not null;index" json:"userId"`
 	StripeSessionID  string     `gorm:"column:stripe_session_id;type:varchar(255);uniqueIndex;not null" json:"stripeSessionId"`
 	VerificationFlow string     `gorm:"column:verification_flow;type:varchar(255)" json:"verificationFlow"`
 	Status           string     `gorm:"column:status;type:varchar(50);not null" json:"status"`
@@ -81,15 +59,6 @@ type VerificationSession struct {
 }
 
 func (VerificationSession) TableName() string { return "identity_verification_sessions" }
-
-// currentUser resolves the authenticated Auth0 user data from context.
-func currentUser() (*myauth.UserData, error) {
-	userData, ok := auth.Data().(*myauth.UserData)
-	if !ok || userData == nil {
-		return nil, &errs.Error{Code: errs.Unauthenticated, Message: "missing or invalid user auth data"}
-	}
-	return userData, nil
-}
 
 type CreateVerificationSessionResponse struct {
 	SessionID string `json:"sessionId"`
@@ -104,15 +73,18 @@ type CreateVerificationSessionResponse struct {
 //
 //encore:api auth method=POST path=/identity/verification-sessions
 func (s *Service) CreateVerificationSession(ctx context.Context) (*CreateVerificationSessionResponse, error) {
-	userData, err := currentUser()
+	user, err := s.GetOrCreateUser(ctx)
 	if err != nil {
-		return nil, err
+		return nil, &errs.Error{
+			Code:    errs.Internal,
+			Message: "Failed to resolve user account",
+		}
 	}
 
 	// Don't spend a new verification on a user who is already verified.
 	var existing VerificationSession
 	err = s.db.WithContext(ctx).
-		Where("auth0_id = ?", userData.Auth0ID).
+		Where("user_id = ?", user.ID).
 		Order("created_at DESC").
 		First(&existing).Error
 	if err == nil && existing.Status == string(stripe.IdentityVerificationSessionStatusVerified) {
@@ -125,14 +97,15 @@ func (s *Service) CreateVerificationSession(ctx context.Context) (*CreateVerific
 		return nil, fmt.Errorf("failed to look up existing verification session: %w", err)
 	}
 
+	fmt.Println(user.Email)
 	params := &stripe.IdentityVerificationSessionParams{
 		VerificationFlow: stripe.String(cfg.VerificationFlowID()),
 		ReturnURL:        stripe.String(cfg.ReturnURL()),
 		ProvidedDetails: &stripe.IdentityVerificationSessionProvidedDetailsParams{
-			Email: stripe.String(userData.Email),
+			Email: stripe.String(user.Email),
 		},
 	}
-	params.AddMetadata("auth0_id", userData.Auth0ID)
+	params.AddMetadata("user_id", fmt.Sprintf("%d", user.ID))
 
 	session, err := verificationsession.New(params)
 	if err != nil {
@@ -143,7 +116,7 @@ func (s *Service) CreateVerificationSession(ctx context.Context) (*CreateVerific
 	}
 
 	record := VerificationSession{
-		Auth0ID:          userData.Auth0ID,
+		UserID:           user.ID,
 		StripeSessionID:  session.ID,
 		VerificationFlow: session.VerificationFlow,
 		Status:           string(session.Status),
@@ -170,14 +143,17 @@ type VerificationStatusResponse struct {
 //
 //encore:api auth method=GET path=/identity/verification-status
 func (s *Service) GetVerificationStatus(ctx context.Context) (*VerificationStatusResponse, error) {
-	userData, err := currentUser()
+	user, err := s.GetOrCreateUser(ctx)
 	if err != nil {
-		return nil, err
+		return nil, &errs.Error{
+			Code:    errs.Internal,
+			Message: "Failed to resolve user account",
+		}
 	}
 
 	var record VerificationSession
 	err = s.db.WithContext(ctx).
-		Where("auth0_id = ?", userData.Auth0ID).
+		Where("user_id = ?", user.ID).
 		Order("created_at DESC").
 		First(&record).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -229,7 +205,7 @@ func (s *Service) HandleStripeWebhook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if err := s.applySessionUpdate(r.Context(), &session); err != nil {
+		if err := s.applyVerificationSessionUpdate(r.Context(), &session); err != nil {
 			http.Error(w, "failed to process event", http.StatusInternalServerError)
 			return
 		}
@@ -238,9 +214,9 @@ func (s *Service) HandleStripeWebhook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// applySessionUpdate upserts the local record for a Stripe verification
-// session based on a webhook event payload.
-func (s *Service) applySessionUpdate(ctx context.Context, session *stripe.IdentityVerificationSession) error {
+// applyVerificationSessionUpdate upserts the local record for a Stripe
+// verification session based on a webhook event payload.
+func (s *Service) applyVerificationSessionUpdate(ctx context.Context, session *stripe.IdentityVerificationSession) error {
 	updates := map[string]interface{}{
 		"status":            string(session.Status),
 		"last_error_code":   "",
@@ -266,8 +242,13 @@ func (s *Service) applySessionUpdate(ctx context.Context, session *stripe.Identi
 	if result.RowsAffected == 0 {
 		// The session wasn't created through CreateVerificationSession (e.g.
 		// started directly from the Stripe dashboard) — record it now.
+		var userID int64
+		if _, err := fmt.Sscanf(session.Metadata["user_id"], "%d", &userID); err != nil || userID == 0 {
+			return fmt.Errorf("verification session %s has no known user_id, cannot record", session.ID)
+		}
+
 		record := VerificationSession{
-			Auth0ID:          session.Metadata["auth0_id"],
+			UserID:           userID,
 			StripeSessionID:  session.ID,
 			VerificationFlow: session.VerificationFlow,
 			Status:           string(session.Status),

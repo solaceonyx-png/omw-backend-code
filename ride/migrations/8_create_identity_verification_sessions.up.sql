@@ -1,6 +1,6 @@
 CREATE TABLE IF NOT EXISTS identity_verification_sessions (
     id BIGSERIAL PRIMARY KEY,
-    auth0_id VARCHAR(255) NOT NULL,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     stripe_session_id VARCHAR(255) NOT NULL UNIQUE,
     verification_flow VARCHAR(255),
     status VARCHAR(50) NOT NULL,
@@ -11,4 +11,4 @@ CREATE TABLE IF NOT EXISTS identity_verification_sessions (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_identity_verification_sessions_auth0_id ON identity_verification_sessions(auth0_id);
+CREATE INDEX IF NOT EXISTS idx_identity_verification_sessions_user_id ON identity_verification_sessions(user_id);
