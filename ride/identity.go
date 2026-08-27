@@ -186,19 +186,24 @@ const maxWebhookBodyBytes = 65536
 //
 //encore:api public raw method=POST path=/identity/webhook
 func (s *Service) HandleStripeWebhook(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("HandleStripeWebhook: request received")
 	r.Body = http.MaxBytesReader(w, r.Body, maxWebhookBodyBytes)
 
 	payload, err := io.ReadAll(r.Body)
 	if err != nil {
+		fmt.Println("HandleStripeWebhook: body read error:", err)
 		http.Error(w, "request body too large or unreadable", http.StatusBadRequest)
 		return
 	}
 
 	event, err := webhook.ConstructEvent(payload, r.Header.Get("Stripe-Signature"), secrets.StripeWebhookSecret)
 	if err != nil {
+		fmt.Println("HandleStripeWebhook: signature verification error:", err)
 		http.Error(w, "invalid signature", http.StatusBadRequest)
 		return
 	}
+
+	fmt.Println("HandleStripeWebhook: verified event type:", event.Type)
 
 	switch event.Type {
 	case stripe.EventTypeIdentityVerificationSessionVerified,
@@ -208,14 +213,18 @@ func (s *Service) HandleStripeWebhook(w http.ResponseWriter, r *http.Request) {
 
 		var session stripe.IdentityVerificationSession
 		if err := json.Unmarshal(event.Data.Raw, &session); err != nil {
+			fmt.Println("HandleStripeWebhook: payload unmarshal error:", err)
 			http.Error(w, "malformed event payload", http.StatusBadRequest)
 			return
 		}
 
 		if err := s.applyVerificationSessionUpdate(r.Context(), &session); err != nil {
+			fmt.Println("HandleStripeWebhook: apply update error:", err)
 			http.Error(w, "failed to process event", http.StatusInternalServerError)
 			return
 		}
+
+		fmt.Println("HandleStripeWebhook: applied update for session:", session.ID)
 	}
 
 	w.WriteHeader(http.StatusOK)
