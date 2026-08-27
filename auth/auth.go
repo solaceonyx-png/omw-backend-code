@@ -162,11 +162,19 @@ func AuthHandler(ctx context.Context, token string) (auth.UID, *UserData, error)
 		return "", nil, &errs.Error{Code: errs.Unauthenticated, Message: "missing sub claim"}
 	}
 
-	email, _ := claims["email"].(string)
-
 	// Auth0 custom namespace claims (e.g. from your Action)
-	var roles []string
 	namespace := "https://staging-omw-backend-code-dwpi.encr.app"
+
+	// Access tokens for a custom API audience don't carry standard OIDC
+	// claims like "email" — only ID tokens do. Prefer the namespaced claim
+	// (set by the same Action that adds roles below), falling back to the
+	// plain claim for ID tokens.
+	email, _ := claims[namespace+"/email"].(string)
+	if email == "" {
+		email, _ = claims["email"].(string)
+	}
+
+	var roles []string
 	if rawRoles, exists := claims[namespace+"/roles"].([]interface{}); exists {
 		for _, r := range rawRoles {
 			if roleStr, ok := r.(string); ok {

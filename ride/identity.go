@@ -63,8 +63,14 @@ func (VerificationSession) TableName() string { return "identity_verification_se
 type CreateVerificationSessionResponse struct {
 	SessionID string `json:"sessionId"`
 	// URL is the short-lived (48h), single-use Stripe-hosted page to redirect
-	// the user to. Empty when the user is already verified.
-	URL    string `json:"url,omitempty"`
+	// the user to. Use this for the hosted redirect flow.
+	URL string `json:"url,omitempty"`
+	// ClientSecret is the short-lived (24h), single-use secret for
+	// Stripe.js's embedded verification modal (stripe.verifyIdentity()).
+	// Don't store, log, or embed it anywhere other than immediately handing
+	// it to Stripe.js.
+	ClientSecret string `json:"clientSecret,omitempty"`
+	// Both URL and ClientSecret are empty when the user is already verified.
 	Status string `json:"status"`
 }
 
@@ -126,9 +132,10 @@ func (s *Service) CreateVerificationSession(ctx context.Context) (*CreateVerific
 	}
 
 	return &CreateVerificationSessionResponse{
-		SessionID: session.ID,
-		URL:       session.URL,
-		Status:    string(session.Status),
+		SessionID:    session.ID,
+		URL:          session.URL,
+		ClientSecret: session.ClientSecret,
+		Status:       string(session.Status),
 	}, nil
 }
 
