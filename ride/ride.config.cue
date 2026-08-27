@@ -1,5 +1,5 @@
 // The Verification Flow ID from the Stripe dashboard: Identity > Verification flows.
-VerificationFlowID: "vf_1U8S6kEu3KpqnXK0HPrW5pZM"
+VerificationFlowID: "vf_1U99PhIy3UujDDDdGc3VG7B4"
 
 // Default for cloud deployments — where Stripe redirects the user back to
 // after they finish (or exit) the hosted verification page.
